@@ -1,0 +1,16 @@
+# Secrets — never commit your API key
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / office lock files
+.~lock.*#
+
+# Distribution artifact (the repo replaces the zip)
+iso34504_converter.zip
+
+# Generated prompt outputs and batch data (tool output, not source)
+*_prompts.csv
+backup/
