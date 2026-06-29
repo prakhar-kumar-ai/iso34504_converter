@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -137,6 +138,65 @@ def _fmt_dist(dist: dict, unit: str) -> str:
     return str(dist.get("values", "")) if isinstance(dist, dict) else ""
 
 
+def _clean_label(name: str, pid: str) -> str:
+    """Human label for a swept parameter, scrubbed of ADS-target wording.
+
+    Falls back to the param id when no name is present. 'set/target/desired/
+    cruise speed' is rewritten to plain 'speed' so the deterministic Sweep line
+    honours the same no-set-speed rule the prose follows.
+    """
+    label = (name or pid.lstrip("p_").replace("_", " ")).strip().lower()
+    label = re.sub(r"\b(set|target|desired|cruise)\s+speed\b", "speed", label)
+    return re.sub(r"\s+", " ", label).strip()
+
+
+def _build_sweep(params: list[dict]) -> str:
+    """Construct the 'Sweep:' line deterministically from the source ranges.
+
+    Only genuinely swept knobs are included: uniform distributions with a real
+    range (min != max) and discrete distributions with more than one value.
+    Fixed single values are left for the prose (e.g. a stationary lead).
+    """
+    parts = []
+    for p in params:
+        dist = p.get("dist", {})
+        if not isinstance(dist, dict):
+            continue
+        label = _clean_label(p.get("name", ""), p.get("id", ""))
+        unit = p.get("unit", "")
+        if dist.get("type") == "uniform":
+            lo, hi = _dist_range(dist)
+            if lo is None or lo == hi:
+                continue
+            rng = f"{lo}–{hi} {unit}".strip()
+        elif dist.get("type") == "discrete":
+            vals = dist.get("values", [])
+            if not isinstance(vals, list) or len(vals) < 2:
+                continue
+            rng = f"{', '.join(str(v) for v in vals)} {unit}".strip()
+        else:
+            continue
+        parts.append(f"{label} {rng}".strip())
+    if not parts:
+        return ""
+    return "Sweep: " + ", ".join(parts) + "."
+
+
+def _strip_appended_lines(text: str) -> str:
+    """Remove any tag/source/Sweep lines the model emitted.
+
+    Those lines are appended deterministically, so anything the model produces
+    here is discarded to avoid duplicate or inaccurate trailing lines.
+    """
+    out = []
+    for line in text.splitlines():
+        ls = line.strip().lower()
+        if ls.startswith(("sweep:", "add tag", "source:", "source_")):
+            continue
+        out.append(line)
+    return "\n".join(out).strip()
+
+
 # ── Few-shot golden examples ───────────────────────────────────────────────────
 
 _GOLDEN = [
@@ -146,9 +206,7 @@ _GOLDEN = [
             "Create a scenario where ego truck is cruising at 55 kph on a 2-lane highway. "
             "A passenger car in the adjacent right lane is travelling at 90 kph and initiates "
             "a lane change into ego's lane from behind, starting with a 10m gap to ego's rear. "
-            "The lane change completes in 0.8 seconds. Use TTC trigger.\n"
-            "Add tag \"source_SC-HWY-LF-0002, sotif\"\n"
-            "Sweep: ego speed 55–65 kph, actor speed 60–90 kph, cut-in gap 10–20 m."
+            "The lane change completes in 0.8 seconds. Use TTC trigger."
         ),
     },
     {
@@ -157,9 +215,7 @@ _GOLDEN = [
             "Create a scenario where ego truck is cruising at 80 kph on a 4-lane highway with no lead vehicle. "
             "Ego decelerates at 5 m/s² and comes to a full stop in the travel lane. "
             "A passenger car follows 30m behind at 90 kph and a heavy truck follows 80m behind at 80 kph. "
-            "The gap closes as ego stops.\n"
-            "Add tag \"source_SC-HWY-LF-0007, sotif\"\n"
-            "Sweep: ego initial speed 80–90 kph, ego decel rate 2–5 m/s², following car speed 70–90 kph, initial gap 30–100 m."
+            "The gap closes as ego stops."
         ),
     },
     {
@@ -167,9 +223,7 @@ _GOLDEN = [
         "prompt": (
             "Create a scenario where ego truck is following a lead vehicle on a 3-lane highway at 85 kph with a 10m gap. "
             "The lead vehicle is carrying an oversize load with long pipes protruding from its rear "
-            "and travelling at 55 kph. The gap is closing.\n"
-            "Add tag \"source_SC-HWY-LF-0013, sotif\"\n"
-            "Sweep: initial gap 10–80 m, ego speed 80–90 kph."
+            "and travelling at 55 kph. The gap is closing."
         ),
     },
     {
@@ -177,9 +231,7 @@ _GOLDEN = [
         "prompt": (
             "Create a scenario where ego truck is following a lead vehicle on a 3-lane highway at 85 kph with a 10m gap. "
             "The lead vehicle brakes hard at 5 m/s². "
-            "A vehicle in the adjacent right lane at 85 kph blocks any evasive lane change. The gap closes.\n"
-            "Add tag \"source_SC-HWY-LF-0014, sotif\"\n"
-            "Sweep: initial gap 10–80 m, lead decel rate 2–5 m/s², adjacent vehicle speed 80–90 kph."
+            "A vehicle in the adjacent right lane at 85 kph blocks any evasive lane change. The gap closes."
         ),
     },
 ]
@@ -198,11 +250,10 @@ _SYSTEM = (
     "- NEVER add ego control instructions such as 'do not add adaptive cruise to ego' or 'ego maintains constant speed'. Just state ego's actual speed.\n"
     "- State ego's speed ONCE in the opening clause. Do NOT restate it later ('ego maintains its reduced speed of 60 kph', 'ego remains at 60 kph'). Mention ego again only if it changes (decelerates, stops, changes lane).\n"
     "- Set fixed values at the CRITICAL BOUNDARY (worst case): smallest gaps, highest speed deltas, harshest decel.\n"
-    "- Always end with 'Sweep: ...' listing critical parameters and ranges. Do NOT include 'set speed' as a sweep parameter.\n"
+    "- Do NOT write a 'Sweep:' line, an 'Add tag' line, or any 'source'/'Source:' line. Those are appended automatically after your text — output the descriptive paragraph ONLY.\n"
+    "- Do NOT mention a 'set speed' as a parameter or value anywhere.\n"
     "- For cut-in from BEHIND: write 'Use TTC trigger.'\n"
-    "- For traceability, do NOT write a 'Source: ...' sentence. Instead add exactly one line right before the Sweep line: Add tag \"source_SC-HWY-LF-XXXX, sotif\" (replace XXXX with the scenario's parent id, keep the quotes).\n"
-    "- NEVER add a 'source:' field.\n"
-    "- Under 100 words. One short paragraph + the tag line + the sweep line. No markdown. Output prompt only.\n"
+    "- Under 100 words. One short paragraph only. No markdown. Output the description only.\n"
     "- NEVER mention weather, rain, wet road, friction, lighting, visibility, glare, lane markings, lane-marking color/type, degraded markings, or road surface condition — those are not scriptable.\n"
     "- ALWAYS state the lane count explicitly: '2-lane highway', '3-lane highway', '4-lane highway'.\n\n"
     "Examples:\n\n"
@@ -219,7 +270,7 @@ _SYSTEM = (
 # Sentences containing these are dropped from the text fed to Haiku so they
 # don't get echoed into the prompt.
 _FAULT_MARKERS = (
-    "autonomous driving system", "ads ", "adas", "perception", "sensor",
+    "autonomous driving system", "ads", "adas", "perception", "sensor",
     "does not command", "does not issue", "fails to command",
     "fails to issue", "fails to detect", "no command",
     "lane marking", "lane_marking", "degraded marking", "road surface",
@@ -227,17 +278,21 @@ _FAULT_MARKERS = (
 )
 
 
+def _has_marker(text: str, marker: str) -> bool:
+    """Word-boundary marker match so 'ads' does not match 'leads'/'roads'."""
+    return re.search(r"\b" + re.escape(marker.strip()) + r"\b", text.lower()) is not None
+
+
 def _sanitize_text(text: str) -> str:
     """Drop sentences that reference ADS faults or non-scriptable ODD conditions."""
     if not text:
         return text
-    import re
     sentences = re.split(r"(?<=[.!?])\s+", text)
-    kept = [s for s in sentences if not any(m in s.lower() for m in _FAULT_MARKERS)]
+    kept = [s for s in sentences if not any(_has_marker(s, m) for m in _FAULT_MARKERS)]
     return " ".join(kept).strip()
 
 
-def generate_prompt(ex: dict) -> str:
+def generate_prompt(ex: dict, source_tag: str = "") -> str:
     import anthropic
     client = anthropic.Anthropic()
 
@@ -253,11 +308,11 @@ def generate_prompt(ex: dict) -> str:
         f"Lanes: {ex['lane_count']}, geometry: {ex['geometry']}, speed limit: {ex['speed_limit']} kph\n"
         f"Risk tier: {ex['risk_tier']}\n\n"
         f"Actors:\n{json.dumps(ex['actors'], indent=2)}\n\n"
-        f"Critical parameters:\n"
+        f"Scriptable parameters:\n"
         + "\n".join(
             f"  {p['id']} ({p['name']}): " + _fmt_dist(p['dist'], p['unit'])
             for p in ex['params']
-            if p['sensitivity'] in ('critical', '')
+            if p['sensitivity'] in ('critical', 'influential', '')
         )
         + f"\n\nPhases:\n" + "\n".join(f"  {ph['name']} ({ph['dur_s']}s): {_sanitize_text(ph['desc'])}" for ph in phases)
         + f"\n\nTrigger: {trigger}"
@@ -269,7 +324,14 @@ def generate_prompt(ex: dict) -> str:
         system=_SYSTEM,
         messages=[{"role": "user", "content": user_msg}],
     )
-    return resp.content[0].text.strip()
+
+    prose = _strip_appended_lines(resp.content[0].text.strip())
+    tag_id = source_tag or ex.get("scenario_id") or ex.get("parent_id")
+    lines = [prose, f'Add tag "source_{tag_id}, sotif"']
+    sweep = _build_sweep(ex["params"])
+    if sweep:
+        lines.append(sweep)
+    return "\n".join(lines)
 
 
 # ── Verification helpers ──────────────────────────────────────────────────────
@@ -300,10 +362,11 @@ def verify_prompt(prompt: str, ex: dict) -> list[str]:
 
     # No ADS-fault / non-scriptable ODD wording should leak into the prompt
     pl = prompt.lower()
-    leaked = [w for w in ("fail", "autonomous driving system", "ads ", "perception",
+    leaked = [w for w in ("fail", "autonomous driving system", "perception",
                           "sensor", "lane marking", "road surface", "set speed",
                           "target speed", "adaptive cruise")
               if w in pl]
+    leaked += [w for w in ("ads", "adas") if _has_marker(prompt, w)]
     if leaked:
         issues.append(f"Leaked non-scriptable wording: {', '.join(leaked)}")
 
@@ -392,13 +455,14 @@ def main():
         else:
             if args.verbose:
                 print(f"  Generating: {ex['scenario_id']}...")
-            prompt = generate_prompt(ex)
+            prompt = generate_prompt(ex, source_tag=ex["scenario_id"])
 
         verification_issues = verify_prompt(prompt, ex) if args.verify else []
 
         rows.append({
             "source_file":       str(fpath),
             "scenario_id":       ex["scenario_id"],
+            "variant_id":        fpath.stem,
             "parent_id":         ex["parent_id"],
             "use_case_name":     ex["use_case_name"],
             "stpa_refs":         ", ".join(ex.get("stpa_refs", [])),
@@ -413,7 +477,7 @@ def main():
         if args.verbose and verification_issues:
             print(f"    VERIFICATION ISSUES: {verification_issues}")
 
-    fieldnames = ["source_file", "scenario_id", "parent_id", "use_case_name",
+    fieldnames = ["source_file", "scenario_id", "variant_id", "parent_id", "use_case_name",
                   "stpa_refs", "risk_tier", "lane_count", "geometry",
                   "ego_action", "prompt", "verification_issues"]
     with open(out, "w", newline="") as f:
