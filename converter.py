@@ -59,6 +59,7 @@ def extract(data: dict, include_ego_action: bool = False) -> dict:
     trace      = sc.get("traceability", {})
     criticality= sc.get("criticality", {})
     dyn        = sc.get("dynamic_behavior", {})
+    rjo        = sc.get("expected_behavior", {}).get("rjo_decomposition", {}) or {}
 
     actors = [
         {
@@ -109,6 +110,11 @@ def extract(data: dict, include_ego_action: bool = False) -> dict:
         "phases":       phases,
         "trigger":      dyn.get("trigger_condition", ""),
         "expected":     dyn.get("expected_ads_response", ""),
+        "rjo": {
+            "recognize": rjo.get("recognize", ""),
+            "judge":     rjo.get("judge", ""),
+            "operate":   rjo.get("operate", ""),
+        },
     }
 
 
@@ -182,6 +188,31 @@ def _build_sweep(params: list[dict]) -> str:
     return "Sweep: " + ", ".join(parts) + "."
 
 
+_SETSPEED_CLAUSE = re.compile(
+    r"\s*,?\s*(?:below|under)\s+(?:its|the)\s+set\s+speed(?:\s+of\s+\d+\s*kph)?"
+    r"|\s*,?\s*with\s+a\s+\d+\s*kph\s+speed\s+limit"
+    r"|\s*,?\s*\d+\s*kph\s+speed\s+limit",
+    re.IGNORECASE,
+)
+
+
+def _scrub_scene(prose: str) -> str:
+    """Remove non-scriptable set-speed/speed-limit clauses from scene lines.
+
+    The Expectation line is left untouched (set speed is allowed there).
+    """
+    out = []
+    for line in prose.splitlines():
+        if line.strip().lower().startswith("expectation:"):
+            out.append(line)
+            continue
+        cleaned = _SETSPEED_CLAUSE.sub("", line)
+        cleaned = re.sub(r"\s+([,.])", r"\1", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+        out.append(cleaned)
+    return "\n".join(out)
+
+
 def _strip_appended_lines(text: str) -> str:
     """Remove any tag/source/Sweep lines the model emitted.
 
@@ -206,7 +237,8 @@ _GOLDEN = [
             "Create a scenario where ego truck is cruising at 55 kph on a 2-lane highway. "
             "A passenger car in the adjacent right lane is travelling at 90 kph and initiates "
             "a lane change into ego's lane from behind, starting with a 10m gap to ego's rear. "
-            "The lane change completes in 0.8 seconds. Use TTC trigger."
+            "The lane change completes in 0.8 seconds. Use TTC trigger.\n"
+            "Expectation: ego recognises the cut-in vehicle entering its lane and brakes or holds to keep a safe gap."
         ),
     },
     {
@@ -215,7 +247,8 @@ _GOLDEN = [
             "Create a scenario where ego truck is cruising at 80 kph on a 4-lane highway with no lead vehicle. "
             "Ego decelerates at 5 m/s² and comes to a full stop in the travel lane. "
             "A passenger car follows 30m behind at 90 kph and a heavy truck follows 80m behind at 80 kph. "
-            "The gap closes as ego stops."
+            "The gap closes as ego stops.\n"
+            "Expectation: ego comes to a controlled stop while monitoring the closing followers and holds position safely."
         ),
     },
     {
@@ -223,7 +256,8 @@ _GOLDEN = [
         "prompt": (
             "Create a scenario where ego truck is following a lead vehicle on a 3-lane highway at 85 kph with a 10m gap. "
             "The lead vehicle is carrying an oversize load with long pipes protruding from its rear "
-            "and travelling at 55 kph. The gap is closing."
+            "and travelling at 55 kph. The gap is closing.\n"
+            "Expectation: ego recognises the slower lead vehicle and decelerates to maintain a safe following gap."
         ),
     },
     {
@@ -231,7 +265,8 @@ _GOLDEN = [
         "prompt": (
             "Create a scenario where ego truck is following a lead vehicle on a 3-lane highway at 85 kph with a 10m gap. "
             "The lead vehicle brakes hard at 5 m/s². "
-            "A vehicle in the adjacent right lane at 85 kph blocks any evasive lane change. The gap closes."
+            "A vehicle in the adjacent right lane at 85 kph blocks any evasive lane change. The gap closes.\n"
+            "Expectation: ego brakes promptly to avoid the decelerating lead without an unsafe lane change into the occupied adjacent lane."
         ),
     },
 ]
@@ -250,10 +285,11 @@ _SYSTEM = (
     "- NEVER add ego control instructions such as 'do not add adaptive cruise to ego' or 'ego maintains constant speed'. Just state ego's actual speed.\n"
     "- State ego's speed ONCE in the opening clause. Do NOT restate it later ('ego maintains its reduced speed of 60 kph', 'ego remains at 60 kph'). Mention ego again only if it changes (decelerates, stops, changes lane).\n"
     "- Set fixed values at the CRITICAL BOUNDARY (worst case): smallest gaps, highest speed deltas, harshest decel.\n"
-    "- Do NOT write a 'Sweep:' line, an 'Add tag' line, or any 'source'/'Source:' line. Those are appended automatically after your text — output the descriptive paragraph ONLY.\n"
-    "- Do NOT mention a 'set speed' as a parameter or value anywhere.\n"
+    "- Do NOT write a 'Sweep:' line, an 'Add tag' line, or any 'source'/'Source:' line. Those are appended automatically after your text — output the descriptive paragraph and the Expectation line ONLY.\n"
+    "- Do NOT mention a 'set speed' in the scene paragraph: state only ego's actual cruising speed, and do NOT add clauses like 'below its set speed of X kph' or 'with a 90 kph speed limit'. The set speed may appear ONLY in the Expectation line below.\n"
     "- For cut-in from BEHIND: write 'Use TTC trigger.'\n"
-    "- Under 100 words. One short paragraph only. No markdown. Output the description only.\n"
+    "- After the scene paragraph, add exactly ONE line starting with 'Expectation: ' that states what EGO is expected to do, synthesised from the recognize/judge/operate behavior provided. Phrase it as ego behavior, e.g. 'Expectation: ego recognises its speed is below the set speed and resumes acceleration, or maintains speed depending on traffic.' The Expectation line MAY reference the set speed. NEVER use 'fail', 'fails', 'ADS', 'system', 'sensor', or 'perception' in it.\n"
+    "- Keep the scene paragraph under 100 words, followed by the single Expectation line. No markdown. Output the scene paragraph and the Expectation line only.\n"
     "- NEVER mention weather, rain, wet road, friction, lighting, visibility, glare, lane markings, lane-marking color/type, degraded markings, or road surface condition — those are not scriptable.\n"
     "- ALWAYS state the lane count explicitly: '2-lane highway', '3-lane highway', '4-lane highway'.\n\n"
     "Examples:\n\n"
@@ -316,6 +352,10 @@ def generate_prompt(ex: dict, source_tag: str = "") -> str:
         )
         + f"\n\nPhases:\n" + "\n".join(f"  {ph['name']} ({ph['dur_s']}s): {_sanitize_text(ph['desc'])}" for ph in phases)
         + f"\n\nTrigger: {trigger}"
+        + "\n\nExpected behavior (recognize/judge/operate) — synthesise the Expectation line from this:\n"
+        + f"  recognize: {_sanitize_text(ex['rjo'].get('recognize', ''))}\n"
+        + f"  judge: {_sanitize_text(ex['rjo'].get('judge', ''))}\n"
+        + f"  operate: {_sanitize_text(ex['rjo'].get('operate', ''))}"
     )
 
     resp = client.messages.create(
@@ -325,7 +365,7 @@ def generate_prompt(ex: dict, source_tag: str = "") -> str:
         messages=[{"role": "user", "content": user_msg}],
     )
 
-    prose = _strip_appended_lines(resp.content[0].text.strip())
+    prose = _scrub_scene(_strip_appended_lines(resp.content[0].text.strip()))
     tag_id = source_tag or ex.get("scenario_id") or ex.get("parent_id")
     lines = [prose, f'Add tag "source_{tag_id}, sotif"']
     sweep = _build_sweep(ex["params"])
@@ -360,12 +400,20 @@ def verify_prompt(prompt: str, ex: dict) -> list[str]:
     if ex["lane_count"] == 2 and "2-lane" not in prompt and "two-lane" not in prompt.lower():
         issues.append("2-lane road not mentioned")
 
-    # No ADS-fault / non-scriptable ODD wording should leak into the prompt
+    # Expectation line should be present when the source carries RJO behavior
+    if any(ex.get("rjo", {}).values()) and "expectation:" not in prompt.lower():
+        issues.append("Missing 'Expectation:' line")
+
+    # No ADS-fault / non-scriptable ODD wording should leak into the prompt.
+    # 'set speed'/'target speed' are allowed ONLY on the Expectation line.
     pl = prompt.lower()
+    scene = " ".join(
+        l for l in prompt.splitlines() if not l.strip().lower().startswith("expectation:")
+    ).lower()
     leaked = [w for w in ("fail", "autonomous driving system", "perception",
-                          "sensor", "lane marking", "road surface", "set speed",
-                          "target speed", "adaptive cruise")
+                          "sensor", "lane marking", "road surface", "adaptive cruise")
               if w in pl]
+    leaked += [w for w in ("set speed", "target speed") if w in scene]
     leaked += [w for w in ("ads", "adas") if _has_marker(prompt, w)]
     if leaked:
         issues.append(f"Leaked non-scriptable wording: {', '.join(leaked)}")
